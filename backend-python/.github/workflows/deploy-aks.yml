@@ -1,0 +1,70 @@
+name: Deploy backend to AKS
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+  # Or auto-deploy on pushes to main
+  push:
+    branches: [main]
+    paths:
+      - "backend-python/**"
+      - "backend-python/.github/workflows/deploy-aks.yml"
+
+env:
+  IMAGE_NAME: 1v-alerts-api
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: backend-python
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          # JSON from `az ad sp create-for-rbac --name "gh-aks-sp" --sdk-auth`
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to Azure Container Registry
+        run: |
+          az acr login --name "${{ secrets.ACR_NAME }}"
+
+      - name: Build and push Docker image
+        run: |
+          REGISTRY_LOGIN_SERVER="${{ secrets.ACR_LOGIN_SERVER }}"
+          IMAGE="${REGISTRY_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Building image ${IMAGE}"
+          docker build -t "${IMAGE}" .
+          docker push "${IMAGE}"
+
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Deploy to AKS
+        uses: azure/k8s-deploy@v5
+        with:
+          namespace: ${{ secrets.AKS_NAMESPACE }}
+          manifests: |
+            backend-python/k8s/deployment.yaml
+            backend-python/k8s/service.yaml
+          images: |
+            ${{ env.IMAGE }}
+          strategy: rolling
+

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import NotFoundError
 from app.models.alertdef import AlertDef
 from app.models.user import User
-from app.repositories import alertdef_repo
+from app.repositories.alertdef_repo import alertdef_repo
 from app.schemas.alertdef import alertdef_to_response
 
 

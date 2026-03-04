@@ -10,7 +10,11 @@ from passlib.context import CryptContext
 
 from app.core.config import get_settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+# Use pbkdf2_sha256 to avoid bcrypt's 72-byte limit and related errors.
+pwd_context = CryptContext(
+    schemes=["pbkdf2_sha256"],
+    deprecated="auto",
+)
 
 
 def hash_password(plain: str) -> str:

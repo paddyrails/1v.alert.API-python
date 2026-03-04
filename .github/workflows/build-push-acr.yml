@@ -1,0 +1,61 @@
+name: 'Alerts API: Build and Push to ACR'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (picks ACR from that resource group)'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      tag:
+        description: 'Extra tag (e.g. latest); image always tagged with git SHA'
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - 'backend-python/**'
+
+env:
+  SERVICE_NAME: alerts-api
+  # For push events we default to dev; workflow_dispatch uses input
+  RESOURCE_GROUP: rg-surveyplatform-${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker image
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR
+        id: acr
+        run: |
+          ACR_NAME=$(az acr list -g ${{ env.RESOURCE_GROUP }} --query '[0].name' -o tsv)
+          echo "name=$ACR_NAME" >> $GITHUB_OUTPUT
+          echo "server=$(az acr show -n $ACR_NAME --query loginServer -o tsv)" >> $GITHUB_OUTPUT
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ steps.acr.outputs.name }}
+
+      - name: Build and push
+        working-directory: backend-python
+        run: |
+          IMAGE="${{ steps.acr.outputs.server }}/${{ env.SERVICE_NAME }}"
+          TAG="${{ github.sha }}"
+          docker build -t "${IMAGE}:${TAG}" .
+          docker push "${IMAGE}:${TAG}"
+          echo "## Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${IMAGE}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            docker tag "${IMAGE}:${TAG}" "${IMAGE}:${{ github.event.inputs.tag }}"
+            docker push "${IMAGE}:${{ github.event.inputs.tag }}"
+            echo "**Also tagged:** \`${IMAGE}:${{ github.event.inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,143 @@
+name: 'Alerts API: Deploy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      tag:
+        description: 'Image tag (leave empty for latest)'
+        required: false
+
+env:
+  SERVICE_NAME: alerts-api
+  # Adjust to match your RG naming convention
+  RESOURCE_GROUP: rg-surveyplatform-${{ github.event.inputs.environment }}
+  # Namespace that will contain this backend
+  NAMESPACE: survey-platform
+
+jobs:
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Resources
+        id: res
+        run: |
+          echo "aks=$(az aks list -g ${{ env.RESOURCE_GROUP }} --query '[0].name' -o tsv)" >> $GITHUB_OUTPUT
+          ACR_NAME=$(az acr list -g ${{ env.RESOURCE_GROUP }} --query '[0].name' -o tsv)
+          echo "acr_server=$(az acr show -n $ACR_NAME --query loginServer -o tsv)" >> $GITHUB_OUTPUT
+
+      - name: Get AKS Credentials
+        run: az aks get-credentials -g ${{ env.RESOURCE_GROUP }} -n ${{ steps.res.outputs.aks }} --overwrite-existing
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Create Namespace & Secrets
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+          DATABASE_URL="postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+          kubectl create secret generic ${{ env.SERVICE_NAME }}-secrets --namespace ${{ env.NAMESPACE }} \
+            --from-literal=DATABASE_URL="$DATABASE_URL" \
+            --from-literal=JWT_SECRET="$JWT_SECRET" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        run: |
+          TAG="${{ github.event.inputs.tag || 'latest' }}"
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+              spec:
+                containers:
+                  - name: ${{ env.SERVICE_NAME }}
+                    image: ${{ steps.res.outputs.acr_server }}/${{ env.SERVICE_NAME }}:$TAG
+                    ports:
+                      - containerPort: 8000
+                    env:
+                      - name: ENV
+                        value: "${{ github.event.inputs.environment }}"
+                      - name: DATABASE_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${{ env.SERVICE_NAME }}-secrets
+                            key: DATABASE_URL
+                      - name: JWT_SECRET
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${{ env.SERVICE_NAME }}-secrets
+                            key: JWT_SECRET
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+            ports:
+              - port: 80
+                targetPort: 8000
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${{ env.SERVICE_NAME }}-ingress
+            namespace: ${{ env.NAMESPACE }}
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /\$2
+              nginx.ingress.kubernetes.io/use-regex: "true"
+          spec:
+            ingressClassName: nginx
+            rules:
+              - http:
+                  paths:
+                    - path: /api(/|$)(.*)
+                      pathType: ImplementationSpecific
+                      backend:
+                        service:
+                          name: ${{ env.SERVICE_NAME }}
+                          port:
+                            number: 80
+          EOF
+
+      - name: Wait & Summary
+        run: |
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} --timeout=300s
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          echo "## ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint:** http://$IP/api" >> $GITHUB_STEP_SUMMARY
+
